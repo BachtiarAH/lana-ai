@@ -1,14 +1,10 @@
-"""Live mic -> Silero VAD -> utterance wav files.
+"""Live mic -> Silero VAD -> STT -> local LLM. Works headless AND as TUI backend.
 
-Run:  .venv/Scripts/python live_mic.py
-Keys: Ctrl+C to stop.
-
-Each detected utterance is saved to ./utterances/ and passed to
-on_utterance(samples_16k_mono, sample_rate) — plug your STT/LLM there.
+Headless:  .venv/Scripts/python live_mic.py --model medium --lang auto
+TUI:       .venv/Scripts/python tui.py
 """
 import queue
 import threading
-import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -17,21 +13,15 @@ import numpy as np
 import sounddevice as sd
 import torch
 
+from config import Config
 from vad_service import SileroVADService
-from stt_service import transcribe_wav
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
 CHUNK = 512  # 32 ms @16k — required by Silero
 OUT_DIR = Path(__file__).parent / "utterances"
 OUT_DIR.mkdir(exist_ok=True)
-STT_MODEL = "medium"  # tiny/base/small/medium/turbo — medium akurat untuk id, berat di CPU
-STT_LANG = "id"  # "id" / "en" / None (auto-detect, lebih lambat)
-STT_ENABLED = True
-STT_OFFLINE = False
 
 
-def save_wav(path: Path, audio_np: np.ndarray, sr: int = SAMPLE_RATE):
+def save_wav(path: Path, audio_np: np.ndarray, sr: int = 16000):
     pcm = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
@@ -40,35 +30,46 @@ def save_wav(path: Path, audio_np: np.ndarray, sr: int = SAMPLE_RATE):
         wf.writeframes(pcm.tobytes())
 
 
-def on_utterance(audio_np: np.ndarray, sr: int, path: Path):
-    dur = len(audio_np) / sr
-    if dur < 0.5:  # buang klik/batuk sangat pendek
-        print(f"[skip] {path.name} terlalu pendek ({dur:.2f}s)")
-        try:
-            path.unlink(missing_ok=True)
-        except TypeError:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        return
-    print(f"[utterance] {path.name} ({dur:.2f}s) -> transcribing...")
-    if not STT_ENABLED:
-        print(f"[saved] {path}")
-        return
-    try:
-        text = transcribe_wav(path, model_name=STT_MODEL, language=STT_LANG, local_only=STT_OFFLINE)
+class PrintEvents:
+    """Headless fallback: replicate the original print behavior."""
+
+    def state(self, s: str):
+        print(f"[{s}]", flush=True)
+
+    def meter(self, level: float):
+        pass
+
+    def saved(self, path: Path, dur: float):
+        print(f"[saved] {path} ({dur:.2f}s)")
+
+    def transcript(self, path: Path, text: str):
         print(f"[text] {text if text else '(kosong — tidak ada ucapan jelas)'}")
-    except Exception as e:
-        print(f"[stt error] {e}")
+
+    def answer(self, text: str):
+        print(f"[lana] {text}")
+
+    def error(self, msg: str):
+        print(f"[error] {msg}")
 
 
-def main(device=None, threshold=0.5):
+def run_pipeline(cfg: Config, events=None, stop=None, stt_offline: bool = False,
+                 llm=None, history: list | None = None):
+    """Blocking loop. TUI passes its own events + stop flag + llm.
+
+    history: shared list of {'role','content'}; capped at cfg.history_max.
+    """
+    from stt_service import transcribe_wav
+
+    ev = events or PrintEvents()
+    stop = stop or threading.Event()
+    history = history if history is not None else []
+    lock = threading.Lock()
+
     vad = SileroVADService(
-        threshold=threshold,
-        sampling_rate=SAMPLE_RATE,
-        min_silence_duration_ms=300,
-        speech_pad_ms=30,
+        threshold=cfg.vad_threshold,
+        sampling_rate=cfg.sample_rate,
+        min_silence_duration_ms=cfg.min_silence_ms,
+        speech_pad_ms=cfg.speech_pad_ms,
     )
     q: queue.Queue = queue.Queue()
     speaking = False
@@ -76,81 +77,127 @@ def main(device=None, threshold=0.5):
 
     def audio_callback(indata, frames, time_info, status):
         if status:
-            print(status, flush=True)
-        # indata: (frames, channels) float32
+            ev.error(str(status))
         mono = indata[:, 0].copy()
         q.put(mono)
 
-    print(f"Devices:\n{sd.query_devices()}\n")
-    print(f"Listening @ {SAMPLE_RATE}Hz, chunk={CHUNK}, threshold={threshold}. Ctrl+C to stop.")
+    def handle_utterance(audio_np: np.ndarray, sr: int, path: Path):
+        dur = len(audio_np) / sr
+        if dur < cfg.min_utterance_s:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return
+        ev.saved(path, dur)
+        if not cfg.stt_model:  # --no-stt: hanya simpan wav
+            return
+        # STT
+        ev.state("transcribing")
+        try:
+            text = transcribe_wav(path, model_name=cfg.stt_model,
+                                  language=cfg.stt_lang, local_only=stt_offline)
+        except Exception as e:
+            ev.error(f"stt: {e}")
+            ev.state("listening")
+            return
+        if not text:
+            ev.transcript(path, "")
+            ev.state("listening")
+            return
+        ev.transcript(path, text)
+        # LLM
+        if llm is None or not cfg.llm_enabled:
+            ev.state("listening")
+            return
+        ev.state("thinking")
+        with lock:
+            history.append({"role": "user", "content": text})
+            msgs = history[-cfg.history_max:]
+        try:
+            reply = llm.chat(msgs)
+        except Exception as e:
+            ev.error(f"llm: {e}")
+            ev.state("listening")
+            return
+        with lock:
+            history.append({"role": "assistant", "content": reply})
+            while len(history) > cfg.history_max:
+                history.pop(0)
+        ev.answer(reply)
+        ev.state("listening")
 
+    ev.state(f"listening (stt={cfg.stt_model} llm={llm.model if llm else 'off'})")
     stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="float32",
-        blocksize=CHUNK,
-        callback=audio_callback,
-        device=device,
+        samplerate=cfg.sample_rate, channels=1, dtype="float32",
+        blocksize=CHUNK, callback=audio_callback, device=cfg.device,
     )
     with stream:
-        try:
-            while True:
+        while not stop.is_set():
+            try:
+                mono = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            for i in range(0, len(mono), CHUNK):
+                piece = mono[i:i + CHUNK]
+                if len(piece) < CHUNK:
+                    piece = np.pad(piece, (0, CHUNK - len(piece)))
+                ev.meter(float(np.sqrt(np.mean(piece ** 2))))
                 try:
-                    mono = q.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                # sounddevice may deliver !=512 frames on some drivers; slice/pad
-                for i in range(0, len(mono), CHUNK):
-                    piece = mono[i : i + CHUNK]
-                    if len(piece) < CHUNK:
-                        piece = np.pad(piece, (0, CHUNK - len(piece)))
                     event = vad.process_chunk(torch.from_numpy(piece))
+                except Exception as e:
+                    ev.error(f"vad: {e}")
+                    continue
+                if event and "start" in event:
+                    if not speaking:
+                        ev.state("speaking")
+                        speaking = True
+                        buffer = []
+                if speaking:
+                    buffer.append(piece.copy())
+                if event and "end" in event:
+                    ev.state("listening")
+                    speaking = False
+                    if buffer:
+                        utt = np.concatenate(buffer)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                        path = OUT_DIR / f"utt_{ts}.wav"
+                        save_wav(path, utt, cfg.sample_rate)
+                        threading.Thread(target=handle_utterance,
+                                         args=(utt, cfg.sample_rate, path),
+                                         daemon=True).start()
+                        buffer = []
 
-                    if event and "start" in event:
-                        if not speaking:
-                            print("[vad] speech start", flush=True)
-                            speaking = True
-                            buffer = []
-                    if speaking:
-                        buffer.append(piece.copy())
-                    if event and "end" in event:
-                        print("[vad] speech end", flush=True)
-                        speaking = False
-                        if buffer:
-                            utt = np.concatenate(buffer)
-                            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                            path = OUT_DIR / f"utt_{ts}.wav"
-                            save_wav(path, utt)
-                            threading.Thread(
-                                target=on_utterance, args=(utt, SAMPLE_RATE, path), daemon=True
-                            ).start()
-                            buffer = []
-        except KeyboardInterrupt:
-            print("\nStopped.")
+
+def main():
+    import argparse
+
+    p = argparse.ArgumentParser(description="lana-ai headless: mic -> VAD -> STT -> local LLM")
+    Config.add_cli_args(p)
+    args = p.parse_args()
+    cfg = Config.from_args(args)
+    stt_offline = args.offline
+
+    llm = None
+    if cfg.llm_enabled:
+        from llm_service import LocalLLM
+
+        llm = LocalLLM(host=cfg.llm_host, model=cfg.llm_model)
+        # preload STT supaya ucapan pertama tidak delay (download sekali saja)
+        if not args.no_stt:
+            from stt_service import get_model
+
+            try:
+                get_model(cfg.stt_model)
+            except Exception as e:
+                print(f"[warn] preload stt gagal: {e}")
+    if args.no_stt:
+        cfg.stt_model = ""
+    try:
+        run_pipeline(cfg, stt_offline=stt_offline, llm=llm)
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--device", default=None, help="sounddevice index or name")
-    p.add_argument("--threshold", type=float, default=0.5)
-    p.add_argument("--model", default="medium", help="tiny/base/small/medium/turbo")
-    p.add_argument("--lang", default="id", help="id/en, atau auto untuk auto-detect")
-    p.add_argument("--no-stt", action="store_true", help="hanya simpan wav, tanpa teks")
-    p.add_argument("--offline", action="store_true", help="paksa 100% offline, tanpa download (model harus sudah pernah di-download)")
-    args = p.parse_args()
-    STT_MODEL = args.model
-    STT_LANG = None if args.lang == "auto" else args.lang
-    STT_ENABLED = not args.no_stt
-    STT_OFFLINE = args.offline
-    if STT_OFFLINE:
-        import os
-
-        os.environ["HF_HUB_OFFLINE"] = "1"
-    if STT_ENABLED:
-        # preload sekali di awal supaya ucapan pertama tidak delay (download besar utk medium, sekali saja)
-        from stt_service import get_model
-
-        get_model(STT_MODEL, local_only=STT_OFFLINE)
-    main(device=args.device, threshold=args.threshold)
+    main()
